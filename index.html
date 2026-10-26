@@ -208,6 +208,8 @@
   .capbox input::placeholder { color: var(--dim); }
   .dk-grp { display: inline-flex; align-items: center; gap: 2px; }
   .dk.sm { min-width: 38px; padding: 0 8px; } .dk.on { background: rgba(255,255,255,.13); }
+  .dk .pct { display: none; font: 500 12px var(--mono); min-width: 3ch; text-align: center; }
+  .dk.rec .pct { display: inline; } .dk.rec svg { display: none; } .dk.rec { color: var(--accent); pointer-events: none; }
   .bwdot { width: 20px; height: 20px; border-radius: 50%; display: block; background: linear-gradient(90deg, #111 50%, #f2f2f2 50%); box-shadow: inset 0 0 0 1px rgba(255,255,255,.3); }
   .sep { width: 1px; height: 20px; background: rgba(255,255,255,.12); margin: 0 4px; }
   @media (max-width: 640px) { .dk.look span, .dk-name { display: none; } }
@@ -283,7 +285,9 @@ window.SAMPLES = [{"name": "Photo 1", "src": "data:image/jpeg;base64,/9j/4AAQSkZ
     <button class="dk" id="squint" aria-label="Hold to squint" title="Hold to squint (S)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12z"/><circle cx="12" cy="12" r="2.8"/></svg></button>
     <button class="dk" id="cap-btn" aria-label="Write your own caption" title="Your own caption (T)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h4L19 9l-4-4L4 16z"/><path d="M13.5 6.5l4 4"/></svg></button>
     <button class="dk" id="words" aria-pressed="true" aria-label="Words on or off" title="Words (W)"><b>Aa</b></button>
+    <button class="dk" id="motion" aria-pressed="false" aria-label="Move the pixels" title="Move the pixels (M)"><svg viewBox="0 0 24 24" fill="currentColor"><rect x="3" y="3" width="5" height="5"/><rect x="10" y="3" width="5" height="5" opacity=".45"/><rect x="17" y="3" width="4" height="5"/><rect x="3" y="10" width="5" height="5" opacity=".45"/><rect x="12" y="11" width="5" height="5"/><rect x="3" y="17" width="5" height="4"/><rect x="10" y="17" width="5" height="4"/><rect x="17" y="17" width="4" height="4" opacity=".45"/></svg></button>
     <button class="dk" id="dl" aria-label="Download png" title="Download png"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11M7 11l5 5 5-5M5 20h14"/></svg></button>
+    <button class="dk" id="vid" aria-label="Export a looping video" title="Export video (V)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="6" width="12" height="12" rx="2"/><path d="M15 10.5l6-3v9l-6-3"/></svg><span class="pct" id="vid-pct"></span></button>
   </nav>
 </section>
 
@@ -1284,9 +1288,100 @@ $('capclear').onclick = () => { capInput.value = ''; setCaption(''); capInput.fo
 const toggleWords = () => { state.text = !state.text; if (!state.text && (state.design === 'type' || state.design === 'number')) state.design = 'orb'; request(); };
 $('dk-prev').onclick = () => stepDesign(-1); $('dk-next').onclick = () => stepDesign(1); $('dk-look').onclick = () => shuffleColour(); $('dk-og').onclick = () => { state.look = 0; request(); }; $('dk-bw').onclick = () => { state.look = 1; request(); }; $('rot').onclick = () => { state.orient = state.orient === 'wide' ? 'tall' : 'wide'; request(); };
 $('words').onclick = toggleWords; $('cv-0').onclick = () => shuffleDesign();
+/* ================= motion: the same poster, a few pixels on the move =================
+   The finished poster is treated as a pixel source. The picture is cut into cells and, in any frame, a small
+   share of them show a neighbouring patch of the poster instead of their own: they slide out a few cells and
+   settle back. Nothing is ever blended or recoloured, so every pixel on screen is a pixel from the still, and
+   the palette stays exactly the one the poster was printed in.
+   - Which cells hop is decided by hashes, not by Math.random, so a frame is a pure function of (poster, t).
+   - t runs 0..1 around a loop. Each cell hops once per cycle, K cycles to a loop, and the noise field that
+     decides where it is lively travels round a circle in time, so frame 1 follows the last frame seamlessly.
+   - A slow noise field sweeps over the page. Where it is high, most cells hop; elsewhere only a sprinkle do.
+     That is what makes it read as weather moving across the poster rather than TV static. */
+const MOTION = { loop: 8, fps: 30, cell: 6, cycles: 8, hop: .26, base: .07, gain: .85 };
+const DIRS8 = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, -1], [1, -1], [-1, 1]];
+const smooth = (a, b, v) => { const t = clamp((v - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+function makeMotion(poster, seed) {
+  const { loop, cell: cs, cycles: K, hop, base, gain } = MOTION, w = poster.width, h = poster.height, cols = Math.ceil(w / cs), rows = Math.ceil(h / cs);
+  const nz = (i, j, t, z) => {                       // noise on a circle in time: periodic, never jumps
+    const a = t * Math.PI * 2; return vnoise(i * .022 + Math.cos(a) * .9 + z, j * .022 + Math.sin(a) * .9 - z, seed + 3);
+  };
+  return {
+    poster,
+    draw(c, t) {
+      c.imageSmoothingEnabled = false; c.drawImage(poster, 0, 0);
+      for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) {
+        const u = t * K + hash2(i, j, seed), cyc = Math.floor(u), p = (u - cyc) / hop;
+        if (p >= 1) continue;                        // outside this cell's hop window: nearly all cells, nearly all the time
+        const cy = ((cyc % K) + K) % K;
+        if (hash2(i, j, seed + 11 + cy * 7919) > base + gain * smooth(.46, .66, nz(i, j, t, cy * .13))) continue;
+        const dir = DIRS8[(hash2(i, j, seed + 5 + cy * 131) * 8) | 0], mag = 1 + ((hash2(i, j, seed + 9 + cy * 17) * 3) | 0);
+        const off = Math.sin(Math.PI * p) * mag * cs;    // slide out and settle back
+        const dx = i * cs, dy = j * cs, sw = Math.min(cs, w - dx), sh = Math.min(cs, h - dy);
+        const sx = clamp(Math.round(dx + dir[0] * off), 0, w - sw), sy = clamp(Math.round(dy + dir[1] * off), 0, h - sh);
+        c.drawImage(poster, sx, sy, sw, sh, dx, dy, sw, sh);
+      }
+    },
+  };
+}
+
+// live preview on the poster itself
+let motionOn = false, motionEng = null;
+function motionFrame(now) {
+  if (!motionOn) return;
+  const poster = getPoster(), m = $('cv-0');
+  if (!motionEng || motionEng.poster !== poster) motionEng = makeMotion(poster, state.seed);
+  if (m.width !== poster.width || m.height !== poster.height) { m.width = poster.width; m.height = poster.height; }
+  motionEng.draw(m.getContext('2d'), (now / 1000 % MOTION.loop) / MOTION.loop);
+  requestAnimationFrame(motionFrame);
+}
+function setMotion(on) {
+  motionOn = on; $('motion').setAttribute('aria-pressed', on);
+  if (on) requestAnimationFrame(motionFrame); else { motionEng = null; show(true); }
+}
+$('motion').onclick = () => setMotion(!motionOn);
+
+// export: plays the loop once into an off-screen canvas and records it. Real time, so a loop takes MOTION.loop seconds
+function videoMime() {
+  if (!window.MediaRecorder) return '';
+  return ['video/mp4;codecs=avc1.640028', 'video/mp4', 'video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'].find(t => MediaRecorder.isTypeSupported(t)) || '';
+}
+async function recordPoster(onProgress) {
+  const mime = videoMime(); if (!mime) throw new Error('This browser cannot record video. Try Chrome, Edge or Safari.');
+  const poster = getPoster(), seed = state.seed, eng = makeMotion(poster, seed);
+  const cv = mkCanvas(poster.width & ~1, poster.height & ~1), cx = cv.getContext('2d', { alpha: false });   // video codecs want even sizes
+  eng.draw(cx, 0);
+  const rec = new MediaRecorder(cv.captureStream(MOTION.fps), { mimeType: mime, videoBitsPerSecond: 14e6 }), chunks = [];
+  rec.ondataavailable = e => e.data.size && chunks.push(e.data);
+  const stopped = new Promise(r => rec.onstop = r);
+  rec.start(); const t0 = performance.now();
+  await new Promise(done => {
+    const step = now => {
+      const e = (now - t0) / 1000; if (e >= MOTION.loop) return done();
+      eng.draw(cx, e / MOTION.loop); onProgress && onProgress(e / MOTION.loop); requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+  });
+  rec.stop(); await stopped;
+  return new Blob(chunks, { type: mime.split(';')[0] });
+}
+let recording = false;
+async function exportVideo() {
+  if (recording) return; recording = true;
+  const b = $('vid'), pct = $('vid-pct'); b.classList.add('rec'); pct.textContent = '0%';
+  try {
+    const blob = await recordPoster(f => pct.textContent = Math.round(f * 100) + '%');
+    const slug = state.name.replace(/\.[^.]+$/, '').replace(/[^a-z0-9]+/gi, '-').toLowerCase() || 'picture';
+    const a = document.createElement('a'); a.download = `${slug}-${state.design}-${state.orient}.${blob.type.includes('mp4') ? 'mp4' : 'webm'}`;
+    a.href = URL.createObjectURL(blob); a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+  } catch (err) { alert(err.message); }
+  b.classList.remove('rec'); recording = false;
+}
+$('vid').onclick = exportVideo;
+
 $('dl').onclick = () => {
   const slug = state.name.replace(/\.[^.]+$/, '').replace(/[^a-z0-9]+/gi, '-').toLowerCase() || 'picture';
-  const a = document.createElement('a'); a.download = `${slug}-${state.design}-${state.orient}.png`; a.href = $('cv-0').toDataURL('image/png'); a.click();
+  const a = document.createElement('a'); a.download = `${slug}-${state.design}-${state.orient}.png`; a.href = getPoster().toDataURL('image/png'); a.click();
 };
 
 // hold to squint: the poster blurs, and the dither resolves into the picture
@@ -1299,7 +1394,7 @@ addEventListener('keydown', e => {
   if (e.key === 's' && !e.repeat) squint(true, true);
   else if (e.key === ' ') { e.preventDefault(); shuffleDesign(true); }
   else if (e.key === 'ArrowRight') { e.preventDefault(); stepDesign(1, true); } else if (e.key === 'ArrowLeft') { e.preventDefault(); stepDesign(-1, true); }
-  else if (e.key === 'c') shuffleColour(true); else if (e.key === 'o') { state.look = 0; request(true); } else if (e.key === 'b') { state.look = 1; request(true); } else if (e.key === 'w') toggleWords(); else if (e.key === 'r') { state.orient = state.orient === 'wide' ? 'tall' : 'wide'; request(); }
+  else if (e.key === 'c') shuffleColour(true); else if (e.key === 'o') { state.look = 0; request(true); } else if (e.key === 'b') { state.look = 1; request(true); } else if (e.key === 'w') toggleWords(); else if (e.key === 'm') setMotion(!motionOn); else if (e.key === 'v') exportVideo(); else if (e.key === 'r') { state.orient = state.orient === 'wide' ? 'tall' : 'wide'; request(); }
 });
 addEventListener('keyup', e => { if (e.key === 's') squint(false, true); });
 
